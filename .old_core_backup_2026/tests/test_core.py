@@ -5,7 +5,9 @@ Tests for the DNA-inspired compression system.
 import numpy as np
 import pytest
 import os
-from dna_compress.core import DNACompressor, normalize, random_rotation_matrix, benchmark_compression
+import sys, pathlib
+sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
+from core import DNACompressor, normalize, random_rotation_matrix, benchmark_compression
 
 
 class TestNormalize:
