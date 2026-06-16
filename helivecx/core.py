@@ -1,12 +1,20 @@
 """helivecx/core.py
 
-HelivecX – Helix Vector Encoding & Compression
+HelivecX – Helix Vector Encoding & Compression (Indexed-Byte Edition)
 
 Compresses high-dimensional vectors by:
     1. Projecting onto the unit hypersphere.
     2. Applying a random orthogonal rotation (QR decomposition).
     3. Mapping the rotated trajectory into a generalized helix (DNA-style folding).
-    4. Quantizing helix coordinates using the known post-rotation Gaussian distribution.
+    4. Quantizing helix coordinates into **indexed bytes** where each byte
+       carries a type flag in bit 0 (numeric vs alpha) and a 7-bit payload
+       in bits 1-7, yielding higher semantic density than flat uint8.
+
+The indexed-byte scheme mirrors DNA base-pair encoding: each byte is
+a tagged union where the type bit tells the decoder whether the 7-bit
+payload represents a numeric coordinate (0-127) or a symbolic code
+(A-Z, a-z, 0-9, specials) — packing both *what* and *how much* into
+a single octet.
 
 Typical usage:
     import numpy as np
@@ -28,6 +36,18 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from .indexed import (
+    encode_numeric,
+    decode_numeric,
+    encode_alpha,
+    decode_alpha,
+    byte_type,
+    quantize_to_indexed,
+    dequantize_from_indexed,
+    inspect_byte,
+    NUMERIC_MAX,
+)
 
 
 def normalize(vec: np.ndarray) -> np.ndarray:
@@ -129,6 +149,10 @@ class HelivecX:
         Random seed for generating the repeatable rotation matrix ``Q``.
     pitch, radius: float
         Helix geometry tuning knobs.
+    alpha_channels: int
+        Number of helix columns (trailing) encoded as alpha/symbolic
+        indexed bytes instead of numeric. Default 1 (z-axis = symbolic
+        positional marker, like a base-pair label).
     """
 
     def __init__(
@@ -139,16 +163,19 @@ class HelivecX:
         pitch: float = 1.0,
         radius: float = 1.0,
         quantize: bool = True,
+        alpha_channels: int = 1,
     ):
         self.dim = dim
         self.pitch = pitch
         self.radius = radius
         self.quantize = quantize
+        self.alpha_channels = alpha_channels
+        self.num_channels = 3 - alpha_channels  # helix has 3 columns (x, y, z)
         self.Q = random_rotation_matrix(dim, seed)
         self.Q_inv = self.Q.T  # orthonormal => transpose == inverse
 
-    def compress(self, vec: np.ndarray) -> tuple[np.ndarray, dict]:
-        """Compress a vector.
+    def compress(self, vec: np.ndarray) -> tuple[bytes, dict]:
+        """Compress a vector using indexed-byte encoding.
 
         Parameters
         ----------
@@ -157,8 +184,8 @@ class HelivecX:
 
         Returns
         -------
-        helix_quant: np.ndarray
-            Quantized helix coordinates.
+        indexed_data: bytes
+            Indexed-byte sequence (type-flagged bytes, 1 byte per helix cell).
         metadata: dict
             Metadata needed to invert the transformation.
         """
@@ -169,50 +196,56 @@ class HelivecX:
         u = self.Q @ v
         # Step 2: helical encoding (structured container for visualization)
         helix = helical_encode(u, pitch=self.pitch, radius=self.radius)
-        # Step 3: quantise to 8-bit with per-channel min/max
-        helix_min = helix.min(axis=0)
-        helix_max = helix.max(axis=0)
-        scale = helix_max - helix_min
-        scale[scale == 0] = 1.0
-        helix_norm = (helix - helix_min) / scale * 255
-        helix_quant = helix_norm.astype(np.uint8)
+        # Step 3: indexed-byte quantization
+        #   - First num_channels columns → NUMERIC (x, y coordinates)
+        #   - Last alpha_channels columns → ALPHA (positional markers)
+        indexed_data, qmeta = quantize_to_indexed(
+            helix,
+            num_channels=self.num_channels,
+            alpha_channels=self.alpha_channels,
+        )
         # Store the rotated vector for lossless reconstruction
         u_quant = u.astype(np.float32).tolist()
         metadata = {
             "dim": self.dim,
             "pitch": self.pitch,
             "radius": self.radius,
-            "helix_min": helix_min.tolist(),
-            "scale": scale.tolist(),
             "orig_norm": float(orig_norm),
-            "u": u_quant,  # Store rotated values for lossless reconstruction
-            "reconstruction_mode": "lossless",  # vs "helical_approximation"
+            "u": u_quant,
+            "reconstruction_mode": "lossless",
+            "encoding": "indexed_v2",
+            "num_channels": self.num_channels,
+            "alpha_channels": self.alpha_channels,
+            "helix_rows": int(helix.shape[0]),
+            "helix_cols": int(helix.shape[1]),
+            "quantize_meta": qmeta,
         }
-        return helix_quant, metadata
+        return indexed_data, metadata
 
-    def decompress(self, helix_quant: np.ndarray, metadata: dict) -> np.ndarray:
-        """Decompress a helix back to a vector.
+    def decompress(self, indexed_data: bytes, metadata: dict) -> np.ndarray:
+        """Decompress indexed bytes back to a vector.
 
         Parameters
         ----------
-        helix_quant: np.ndarray
-            Quantised helix from :meth:`compress`.
+        indexed_data: bytes
+            Indexed-byte stream from :meth:`compress`.
         metadata: dict
-            Metadata dictionary produced alongside the helix.
+            Metadata dictionary produced alongside the data.
 
         Returns
         -------
         vec: np.ndarray, shape (dim,)
             Reconstructed (unnormalised) vector.
         """
+        # Lossless mode: use stored rotated vector directly
         if "u" in metadata and metadata.get("reconstruction_mode") == "lossless":
             u = np.array(metadata["u"], dtype=np.float64)
             if np.any(np.isnan(u)) or np.any(np.isinf(u)):
                 # Fallback to helical decode if data is corrupted
-                helix_min = np.array(metadata["helix_min"])
-                scale = np.array(metadata["scale"])
-                helix = helix_quant.astype(np.float64) / 255.0 * scale + helix_min
-                u = helical_decode(helix, self.dim, pitch=self.pitch, radius=self.radius)
+                helix = self._dequantize_helix(indexed_data, metadata)
+                u = helical_decode(
+                    helix, self.dim, pitch=self.pitch, radius=self.radius
+                )
             # Inverse rotation
             rec = self.Q_inv @ u
             # Restore original scale
@@ -220,41 +253,58 @@ class HelivecX:
             rec = rec * orig_norm
             return rec
 
-        # Fallback to helical decode for older or approximation mode
-        helix_min = np.array(metadata["helix_min"])
-        scale = np.array(metadata["scale"])
-        helix = helix_quant.astype(np.float64) / 255.0 * scale + helix_min
-        u_approx = helical_decode(helix, self.dim, pitch=self.pitch, radius=self.radius)
+        # Approximation mode: dequantize helix from indexed bytes
+        helix = self._dequantize_helix(indexed_data, metadata)
+        u_approx = helical_decode(
+            helix, self.dim, pitch=self.pitch, radius=self.radius
+        )
         rec = self.Q_inv @ u_approx
         orig_norm = metadata.get("orig_norm", 1.0)
         return rec * orig_norm
+
+    def _dequantize_helix(self, indexed_data: bytes, metadata: dict) -> np.ndarray:
+        """Reconstruct the helix array from indexed bytes."""
+        rows = metadata.get("helix_rows", self.dim)
+        cols = metadata.get("helix_cols", 3)
+        num_channels = metadata.get("num_channels", self.num_channels)
+        alpha_channels = metadata.get("alpha_channels", self.alpha_channels)
+        qmeta = metadata.get("quantize_meta", {})
+        if not qmeta:
+            # Legacy format: synthesize min/scale
+            qmeta = {
+                "num_channels": num_channels,
+                "alpha_channels": alpha_channels,
+                "col_min": [0.0] * cols,
+                "col_scale": [1.0] * cols,
+            }
+        return dequantize_from_indexed(indexed_data, rows, cols, qmeta)
 
     # ------------------------------------------------------------------ #
     # Serialization helpers
     # ------------------------------------------------------------------ #
 
-    def save(self, helix_quant: np.ndarray, metadata: dict, path: str | Path) -> None:
+    def save(self, indexed_data: bytes, metadata: dict, path: str | Path) -> None:
         """Save compressed data to a binary file.
 
         Format (little-endian):
             <4 bytes> metadata JSON length
             <N bytes> metadata JSON (UTF-8)
-            <2 bytes> rows, <2 bytes> columns (uint16)
-            <remaining> raw uint8 helix data
+            <2 bytes> data length (uint16)
+            <remaining> indexed-byte data
         """
         path = Path(path)
         meta_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
         with path.open("wb") as f:
             f.write(struct.pack("<I", len(meta_bytes)))
             f.write(meta_bytes)
-            f.write(struct.pack("<HH", *helix_quant.shape))
-            f.write(helix_quant.tobytes())
+            f.write(struct.pack("<H", len(indexed_data)))
+            f.write(indexed_data)
 
     @classmethod
-    def load(cls, path: str | Path) -> tuple[np.ndarray, dict]:
+    def load(cls, path: str | Path) -> tuple[bytes, dict]:
         """Load compressed data from a binary file.
 
-        Returns the raw `(helix, metadata)` tuple.  The caller still needs
+        Returns the `(indexed_data, metadata)` tuple. The caller still needs
         to instantiate ``HelivecX`` with matching metadata before calling
         ``decompress``.
         """
@@ -262,9 +312,9 @@ class HelivecX:
         with path.open("rb") as f:
             meta_len = struct.unpack("<I", f.read(4))[0]
             metadata = json.loads(f.read(meta_len).decode("utf-8"))
-            rows, cols = struct.unpack("<HH", f.read(4))
-            helix_data = np.frombuffer(f.read(), dtype=np.uint8).reshape(rows, cols)
-        return helix_data, metadata
+            data_len = struct.unpack("<H", f.read(2))[0]
+            indexed_data = f.read(data_len)
+        return indexed_data, metadata
 
 
 def benchmark_compression(
@@ -290,15 +340,15 @@ def benchmark_compression(
     rec: np.ndarray, optional
     """
     orig_norm = np.linalg.norm(vec)
-    helix, meta = compressor.compress(vec)
-    rec = compressor.decompress(helix, meta)
+    indexed_data, meta = compressor.compress(vec)
+    rec = compressor.decompress(indexed_data, meta)
     # Align signs (direction is only determined up to sign on the sphere)
     if np.dot(rec, normalize(vec)) < 0:
         rec = -rec
     # decompress() already restores original scale, do NOT double-scale
     mse = np.mean((vec - rec) ** 2)
     snr = 10 * np.log10(np.mean(vec**2) / (mse + 1e-12)) if mse > 0 else np.inf
-    compressed = helix.nbytes + len(json.dumps(meta).encode())
+    compressed = len(indexed_data) + len(json.dumps(meta).encode())
     metrics = CompressionMetrics(
         mse=float(mse),
         snr_db=float(snr),
